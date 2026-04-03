@@ -38,6 +38,9 @@ struct wooz_state {
   uint32_t pressed_key;
   int repeat_timer_fd;
 
+  // Periodic screen refresh timer
+  int refresh_timer_fd;
+
   size_t n_done;
 };
 
@@ -61,6 +64,7 @@ struct wooz_output {
   struct wooz_buffer *buffer;
   struct zwlr_screencopy_frame_v1 *screencopy_frame;
   uint32_t screencopy_frame_flags; // enum zwlr_screencopy_frame_v1_flags
+  bool is_refresh; // true if screencopy_frame is a live-refresh (not initial)
 };
 
 struct wooz_window {

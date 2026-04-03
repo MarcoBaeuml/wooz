@@ -41,6 +41,12 @@
 #define KEYBOARD_ZOOM_STEP 10.0
 #define KEY_REPEAT_DELAY_MS 500
 #define KEY_REPEAT_RATE_MS 50
+#define REFRESH_INTERVAL_MS 1000
+
+// Forward declarations
+static bool should_include_output(struct wooz_output *output,
+                                  const char *filter);
+static void render_window(struct wooz_window *win);
 
 static void restore_view(struct wooz_window *win) {
   win->view_source = win->initial_view_source;
@@ -174,18 +180,31 @@ static void screencopy_frame_handle_buffer(
     uint32_t width, uint32_t height, uint32_t stride) {
   struct wooz_output *output = data;
 
-  output->buffer =
-      create_buffer(output->state->shm, format, width, height, stride);
-  if (output->buffer == NULL) {
-    fprintf(stderr, "failed to create buffer\n");
-    exit(EXIT_FAILURE);
-  }
+  // On refresh, reuse the existing buffer if dimensions match to avoid
+  // unnecessary allocations. Otherwise, create a new one.
+  int32_t expected_w = (output->transform & WL_OUTPUT_TRANSFORM_90)
+                           ? (int32_t)height
+                           : (int32_t)width;
+  int32_t expected_h = (output->transform & WL_OUTPUT_TRANSFORM_90)
+                           ? (int32_t)width
+                           : (int32_t)height;
 
-  // Handle rotated screens.
-  if (output->transform & WL_OUTPUT_TRANSFORM_90) {
-    int32_t tmp = output->buffer->width;
-    output->buffer->width = output->buffer->height;
-    output->buffer->height = tmp;
+  if (output->buffer == NULL || output->buffer->width != expected_w ||
+      output->buffer->height != expected_h) {
+    destroy_buffer(output->buffer);
+    output->buffer =
+        create_buffer(output->state->shm, format, width, height, stride);
+    if (output->buffer == NULL) {
+      fprintf(stderr, "failed to create buffer\n");
+      exit(EXIT_FAILURE);
+    }
+
+    // Handle rotated screens.
+    if (output->transform & WL_OUTPUT_TRANSFORM_90) {
+      int32_t tmp = output->buffer->width;
+      output->buffer->width = output->buffer->height;
+      output->buffer->height = tmp;
+    }
   }
 
   zwlr_screencopy_frame_v1_copy(frame, output->buffer->wl_buffer);
@@ -201,7 +220,23 @@ static void screencopy_frame_handle_ready(
     void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t tv_sec_hi,
     uint32_t tv_sec_lo, uint32_t tv_nsec) {
   struct wooz_output *output = data;
-  ++output->state->n_done;
+
+  if (output->is_refresh) {
+    // Find the window for this output and update it with the fresh buffer.
+    struct wooz_window *win;
+    wl_list_for_each(win, &output->state->windows, link) {
+      if (win->output == output) {
+        wl_surface_attach(win->surface, output->buffer->wl_buffer, 0, 0);
+        render_window(win);
+        break;
+      }
+    }
+    output->is_refresh = false;
+    zwlr_screencopy_frame_v1_destroy(output->screencopy_frame);
+    output->screencopy_frame = NULL;
+  } else {
+    ++output->state->n_done;
+  }
 }
 
 static void
@@ -219,6 +254,25 @@ static const struct zwlr_screencopy_frame_v1_listener
         .ready = screencopy_frame_handle_ready,
         .failed = screencopy_frame_handle_failed,
 };
+
+static void trigger_screen_refresh(struct wooz_state *state) {
+  struct wooz_output *output;
+  wl_list_for_each(output, &state->outputs, link) {
+    if (!should_include_output(output, state->config.output_filter)) {
+      continue;
+    }
+    // Skip if a capture is already in progress for this output.
+    if (output->screencopy_frame != NULL) {
+      continue;
+    }
+    output->is_refresh = true;
+    output->screencopy_frame = zwlr_screencopy_manager_v1_capture_output(
+        state->screencopy_manager, false, output->wl_output);
+    zwlr_screencopy_frame_v1_add_listener(output->screencopy_frame,
+                                          &screencopy_frame_listener, output);
+  }
+  wl_display_flush(state->display);
+}
 
 static void xdg_output_handle_logical_position(
     void *data, struct zxdg_output_v1 *xdg_output, int32_t x, int32_t y) {
@@ -891,6 +945,7 @@ int main(int argc, char *argv[]) {
   struct wooz_state state = {0};
   state.config = config;
   state.repeat_timer_fd = -1;
+  state.refresh_timer_fd = -1;
   wl_list_init(&state.outputs);
   wl_list_init(&state.windows);
 
@@ -1033,9 +1088,19 @@ int main(int argc, char *argv[]) {
 
   state.n_done = 1;
 
+  // Create a repeating 1-second timer for live screen refresh.
+  state.refresh_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  if (state.refresh_timer_fd >= 0) {
+    struct itimerspec its;
+    its.it_value.tv_sec = REFRESH_INTERVAL_MS / 1000;
+    its.it_value.tv_nsec = (REFRESH_INTERVAL_MS % 1000) * 1000000L;
+    its.it_interval = its.it_value;
+    timerfd_settime(state.refresh_timer_fd, 0, &its, NULL);
+  }
+
   // Main event loop with timer support
   int wl_fd = wl_display_get_fd(state.display);
-  struct pollfd fds[2];
+  struct pollfd fds[3];
 
   while (state.n_done) {
     // Prepare events before dispatching
@@ -1044,26 +1109,34 @@ int main(int argc, char *argv[]) {
     }
     wl_display_flush(state.display);
 
-    // Set up polling
+    // Set up polling. poll(2) ignores entries with fd < 0, so we always
+    // pass 3 entries and let the kernel skip whichever timers are inactive.
     fds[0].fd = wl_fd;
     fds[0].events = POLLIN;
-    fds[1].fd = state.repeat_timer_fd;
+    fds[1].fd = state.repeat_timer_fd;   // -1 when inactive; ignored by poll
     fds[1].events = POLLIN;
+    fds[2].fd = state.refresh_timer_fd;  // -1 when inactive; ignored by poll
+    fds[2].events = POLLIN;
 
-    int nfds = (state.repeat_timer_fd >= 0) ? 2 : 1;
-
-    if (poll(fds, nfds, -1) < 0) {
+    if (poll(fds, 3, -1) < 0) {
       wl_display_cancel_read(state.display);
       break;
     }
 
-    // Handle timer events
-    if (nfds > 1 && (fds[1].revents & POLLIN)) {
+    // Handle key-repeat timer events
+    if (state.repeat_timer_fd >= 0 && (fds[1].revents & POLLIN)) {
       uint64_t expirations;
       read(state.repeat_timer_fd, &expirations, sizeof(expirations));
       if (state.pressed_key != 0) {
         handle_key_action(&state, state.pressed_key);
       }
+    }
+
+    // Handle screen refresh timer events
+    if (state.refresh_timer_fd >= 0 && (fds[2].revents & POLLIN)) {
+      uint64_t expirations;
+      read(state.refresh_timer_fd, &expirations, sizeof(expirations));
+      trigger_screen_refresh(&state);
     }
 
     // Handle Wayland events
@@ -1079,6 +1152,11 @@ int main(int argc, char *argv[]) {
   if (state.repeat_timer_fd >= 0) {
     stop_key_repeat(&state);
     close(state.repeat_timer_fd);
+  }
+
+  // Clean up screen refresh timer
+  if (state.refresh_timer_fd >= 0) {
+    close(state.refresh_timer_fd);
   }
 
   struct wooz_window *win;
