@@ -1,6 +1,7 @@
 #include <getopt.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,22 @@
 #define KEY_REPEAT_DELAY_MS 500
 #define KEY_REPEAT_RATE_MS 50
 #define REFRESH_INTERVAL_MS 1000
+
+// Set to true by --verbose.
+static bool g_verbose = false;
+
+static void log_debug(const char *fmt, ...) {
+  if (!g_verbose)
+    return;
+  va_list args;
+  va_start(args, fmt);
+  fprintf(stderr, "[wooz] ");
+  vfprintf(stderr, fmt, args);
+  fprintf(stderr, "\n");
+  va_end(args);
+}
+
+#define LOG log_debug
 
 // Forward declarations
 static bool should_include_output(struct wooz_output *output,
@@ -180,6 +197,9 @@ static void screencopy_frame_handle_buffer(
     uint32_t width, uint32_t height, uint32_t stride) {
   struct wooz_output *output = data;
 
+  LOG("screencopy buffer: output='%s' %ux%u stride=%u format=%u",
+      output->name ? output->name : "?", width, height, stride, format);
+
   // On refresh, reuse the existing buffer if dimensions match to avoid
   // unnecessary allocations. Otherwise, create a new one.
   int32_t expected_w = (output->transform & WL_OUTPUT_TRANSFORM_90)
@@ -205,6 +225,11 @@ static void screencopy_frame_handle_buffer(
       output->buffer->width = output->buffer->height;
       output->buffer->height = tmp;
     }
+    LOG("screencopy: allocated new buffer %dx%d",
+        output->buffer->width, output->buffer->height);
+  } else {
+    LOG("screencopy: reusing existing buffer %dx%d",
+        output->buffer->width, output->buffer->height);
   }
 
   zwlr_screencopy_frame_v1_copy(frame, output->buffer->wl_buffer);
@@ -220,6 +245,10 @@ static void screencopy_frame_handle_ready(
     void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t tv_sec_hi,
     uint32_t tv_sec_lo, uint32_t tv_nsec) {
   struct wooz_output *output = data;
+
+  LOG("screencopy ready: output='%s' refresh=%s",
+      output->name ? output->name : "?",
+      output->is_refresh ? "yes" : "no");
 
   if (output->is_refresh) {
     // Find the window for this output and update it with the fresh buffer.
@@ -243,7 +272,11 @@ static void
 screencopy_frame_handle_failed(void *data,
                                struct zwlr_screencopy_frame_v1 *frame) {
   struct wooz_output *output = data;
-  fprintf(stderr, "failed to copy output %s\n", output->name);
+  fprintf(stderr, "failed to copy output '%s' (wlr-screencopy returned failed)\n",
+          output->name ? output->name : "?");
+  fprintf(stderr,
+          "hint: check that the compositor supports wlr-screencopy-unstable-v1\n"
+          "hint: on niri, make sure screen capture is permitted for the session\n");
   exit(EXIT_FAILURE);
 }
 
@@ -289,6 +322,7 @@ static void xdg_output_handle_logical_size(void *data,
 
   output->logical_geometry.width = width;
   output->logical_geometry.height = height;
+  LOG("output logical size: %dx%d", width, height);
 }
 
 static void xdg_output_handle_done(void *data,
@@ -300,6 +334,11 @@ static void xdg_output_handle_done(void *data,
   output->logical_scale = (double)width / output->logical_geometry.width;
   output->ratio = (double)output->logical_geometry.width /
                   (double)output->logical_geometry.height;
+  LOG("output '%s' ready: physical=%dx%d logical=%dx%d scale=%.2f ratio=%.4f",
+      output->name ? output->name : "?",
+      output->geometry.width, output->geometry.height,
+      output->logical_geometry.width, output->logical_geometry.height,
+      output->logical_scale, output->ratio);
 }
 
 static void xdg_output_handle_name(void *data,
@@ -307,12 +346,13 @@ static void xdg_output_handle_name(void *data,
                                    const char *name) {
   struct wooz_output *output = data;
   output->name = strdup(name);
+  LOG("output name: %s", name);
 }
 
 static void xdg_output_handle_description(void *data,
                                           struct zxdg_output_v1 *xdg_output,
                                           const char *name) {
-  // No-op
+  LOG("output description: %s", name);
 }
 
 static const struct zxdg_output_v1_listener xdg_output_listener = {
@@ -333,6 +373,8 @@ static void output_handle_geometry(void *data, struct wl_output *wl_output,
   output->geometry.x = x;
   output->geometry.y = y;
   output->transform = transform;
+  LOG("output geometry: pos=%d,%d physical=%dmm×%dmm transform=%d make='%s' model='%s'",
+      x, y, physical_width, physical_height, transform, make, model);
 }
 
 static void output_handle_mode(void *data, struct wl_output *wl_output,
@@ -343,6 +385,9 @@ static void output_handle_mode(void *data, struct wl_output *wl_output,
   if ((flags & WL_OUTPUT_MODE_CURRENT) != 0) {
     output->geometry.width = output->transform ? height : width;
     output->geometry.height = output->transform ? width : height;
+    LOG("output mode (current): %dx%d@%dHz (effective: %dx%d)",
+        width, height, refresh / 1000,
+        output->geometry.width, output->geometry.height);
   }
 }
 
@@ -354,6 +399,7 @@ static void output_handle_scale(void *data, struct wl_output *wl_output,
                                 int32_t factor) {
   struct wooz_output *output = data;
   output->scale = factor;
+  LOG("output scale: %d", factor);
 }
 
 static const struct wl_output_listener output_listener = {
@@ -391,10 +437,22 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
   xdg_surface_ack_configure(win->xdg_surface, serial);
   wl_surface_attach(win->surface, win->output->buffer->wl_buffer, 0, 0);
 
-  if (win->viewport != NULL && win->configure.width != 0 &&
-      win->configure.height != 0) {
-    wp_viewport_set_destination(win->viewport, win->configure.width,
-                                win->configure.height);
+  if (win->viewport != NULL) {
+    int32_t dest_w = win->configure.width;
+    int32_t dest_h = win->configure.height;
+    if (dest_w == 0 || dest_h == 0) {
+      // Compositor didn't tell us a size (common when --no-fullscreen is used
+      // or when the compositor doesn't enforce fullscreen dimensions).
+      // Fall back to the logical output size.
+      dest_w = win->output->logical_geometry.width;
+      dest_h = win->output->logical_geometry.height;
+      LOG("xdg_surface configure: compositor sent 0x0, falling back to "
+          "logical geometry %dx%d", dest_w, dest_h);
+    }
+    if (dest_w != 0 && dest_h != 0) {
+      LOG("xdg_surface configure: viewport destination %dx%d", dest_w, dest_h);
+      wp_viewport_set_destination(win->viewport, dest_w, dest_h);
+    }
   }
 
   // Apply initial zoom on first configure
@@ -485,6 +543,10 @@ static void xdg_toplevel_configure(void *data,
   win->configure.is_tiled_right = is_tiled_right;
   win->configure.width = width;
   win->configure.height = height;
+  LOG("xdg_toplevel configure: size=%dx%d activated=%d fullscreen=%d "
+      "maximized=%d tiled=%d%d%d%d",
+      width, height, is_activated, is_fullscreen, is_maximized,
+      is_tiled_top, is_tiled_bottom, is_tiled_left, is_tiled_right);
 }
 
 static void xdg_toplevel_close(void *data, struct xdg_toplevel *xdg_toplevel) {
@@ -546,6 +608,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
       state->focused = window;
       window->pointer_x = wl_fixed_to_double(sx);
       window->pointer_y = wl_fixed_to_double(sy);
+      LOG("pointer entered window (output: %s)", window->output->name);
     } else {
       window->is_focused = false;
     }
@@ -560,6 +623,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *pointer,
   wl_list_for_each(window, &state->windows, link) {
     if (window->surface == surface) {
       window->is_focused = false;
+      LOG("pointer left window (output: %s)", window->output->name);
       break;
     }
   }
@@ -569,6 +633,10 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer,
                                   uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
+
+  if (win == NULL) {
+    return;
+  }
 
   double x = wl_fixed_to_double(sx);
   double y = wl_fixed_to_double(sy);
@@ -638,6 +706,10 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
 
+  if (win == NULL) {
+    return;
+  }
+
   double scale = win->view_source.width / win->output->geometry.width;
   // x10 for faster zoom.
   double scroll = wl_fixed_to_double(value) * scale * 10;
@@ -669,12 +741,12 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard,
 static void keyboard_handle_enter(void *data, struct wl_keyboard *keyboard,
                                   uint32_t serial, struct wl_surface *surface,
                                   struct wl_array *keys) {
-  // No-op
+  LOG("keyboard focus gained");
 }
 
 static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
                                   uint32_t serial, struct wl_surface *surface) {
-  // No-op
+  LOG("keyboard focus lost");
 }
 
 static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
@@ -790,6 +862,8 @@ static void handle_global(void *data, struct wl_registry *registry,
                           uint32_t version) {
   struct wooz_state *state = data;
 
+  LOG("global: %s v%u", interface, version);
+
   if (strcmp(interface, wl_compositor_interface.name) == 0) {
     state->compositor =
         wl_registry_bind(registry, name, &wl_compositor_interface, 5);
@@ -837,14 +911,19 @@ static const char usage[] =
     "Usage: wooz [options...]\n"
     "\n"
     "Options:\n"
-    "  -h, --help              Show help message and quit\n"
-    "  --map-close KEY         Set key to close (e.g., 'Esc', 'q')\n"
-    "  --mouse-track           Enable mouse tracking (follow mouse without "
+    "  -h, --help                Show help message and quit\n"
+    "  --map-close KEY           Set key to close (e.g., 'Esc', 'q')\n"
+    "  --mouse-track             Enable mouse tracking (follow mouse without "
     "clicking)\n"
-    "  --output NAME           Run on specific output (e.g., 'DP-1')\n"
-    "  --zoom-in PERCENT       Set initial zoom percentage (e.g., '10%', "
+    "  --output NAME             Run on specific output (e.g., 'DP-1')\n"
+    "  --zoom-in PERCENT         Set initial zoom percentage (e.g., '10%', "
     "'50%')\n"
-    "  --invert-scroll         Invert scroll direction (scroll up zooms in)\n"
+    "  --invert-scroll           Invert scroll direction (scroll up zooms in)\n"
+    "  --verbose                 Print debug messages to stderr\n"
+    "  --no-fullscreen           Don't request fullscreen (useful on niri and\n"
+    "                            other compositors that handle it differently)\n"
+    "  --refresh-interval MS     Screen refresh interval in milliseconds\n"
+    "                            (default: 1000, 0 = disable refresh)\n"
     "\n"
     "Controls:\n"
     "  Mouse scroll            Zoom in/out at mouse position\n"
@@ -885,6 +964,7 @@ static uint32_t parse_key_name(const char *name) {
 
 int main(int argc, char *argv[]) {
   struct wooz_config config = {0};
+  config.refresh_interval_ms = REFRESH_INTERVAL_MS; // default 1 second
 
   static struct option long_options[] = {
       {"help", no_argument, 0, 'h'},
@@ -893,6 +973,9 @@ int main(int argc, char *argv[]) {
       {"output", required_argument, 0, 'o'},
       {"zoom-in", required_argument, 0, 'z'},
       {"invert-scroll", no_argument, 0, 'i'},
+      {"verbose", no_argument, 0, 'V'},
+      {"no-fullscreen", no_argument, 0, 'F'},
+      {"refresh-interval", required_argument, 0, 'r'},
       {0, 0, 0, 0}};
 
   int opt;
@@ -936,6 +1019,24 @@ int main(int argc, char *argv[]) {
     case 'i':
       config.invert_scroll = true;
       break;
+    case 'V':
+      config.verbose = true;
+      g_verbose = true;
+      break;
+    case 'F':
+      config.no_fullscreen = true;
+      break;
+    case 'r': {
+      char *endptr;
+      unsigned long ms = strtoul(optarg, &endptr, 10);
+      if (*endptr != '\0') {
+        fprintf(stderr, "Invalid refresh interval: %s (must be a non-negative "
+                        "number of milliseconds)\n", optarg);
+        return EXIT_FAILURE;
+      }
+      config.refresh_interval_ms = (int)ms;
+      break;
+    }
     default:
       fprintf(stderr, "%s", usage);
       return EXIT_FAILURE;
@@ -1061,14 +1162,20 @@ int main(int argc, char *argv[]) {
     win->output = output;
     win->surface = wl_compositor_create_surface(state.compositor);
     win->viewport = wp_viewporter_get_viewport(state.viewporter, win->surface);
+    // Screencopy captures each output independently starting at (0, 0),
+    // so the viewport source must use 0,0 as origin regardless of the
+    // output's position in the global compositor coordinate space.
     win->view_source = (struct wooz_boxf){
-        .x = (double)output->geometry.x,
-        .y = (double)output->geometry.y,
+        .x = 0.0,
+        .y = 0.0,
         .width = (double)output->geometry.width,
         .height = (double)output->geometry.height,
     };
     // Store initial view for restore/unzoom
     win->initial_view_source = win->view_source;
+    LOG("window created for output '%s': view_source=%dx%d",
+        output->name ? output->name : "?",
+        output->geometry.width, output->geometry.height);
 
     if (win->surface == NULL) {
       fprintf(stderr, "failed to create wayland surface\n");
@@ -1081,21 +1188,33 @@ int main(int argc, char *argv[]) {
     xdg_toplevel_add_listener(win->xdg_toplevel, &xdg_toplevel_listener, win);
     xdg_toplevel_set_app_id(win->xdg_toplevel, "dev.negrel.wooz");
     xdg_toplevel_set_title(win->xdg_toplevel, "wooz");
-    xdg_toplevel_set_fullscreen(win->xdg_toplevel, output->wl_output);
+    if (!state.config.no_fullscreen) {
+      LOG("requesting fullscreen on output '%s'", output->name ? output->name : "?");
+      xdg_toplevel_set_fullscreen(win->xdg_toplevel, output->wl_output);
+    } else {
+      LOG("skipping set_fullscreen (--no-fullscreen)");
+    }
 
     wl_surface_commit(win->surface);
   }
 
   state.n_done = 1;
 
-  // Create a repeating 1-second timer for live screen refresh.
-  state.refresh_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-  if (state.refresh_timer_fd >= 0) {
-    struct itimerspec its;
-    its.it_value.tv_sec = REFRESH_INTERVAL_MS / 1000;
-    its.it_value.tv_nsec = (REFRESH_INTERVAL_MS % 1000) * 1000000L;
-    its.it_interval = its.it_value;
-    timerfd_settime(state.refresh_timer_fd, 0, &its, NULL);
+  // Create a repeating timer for live screen refresh.
+  // refresh_interval_ms == 0 means the user disabled refresh.
+  if (state.config.refresh_interval_ms == 0) {
+    LOG("screen refresh disabled (--refresh-interval 0)");
+  } else {
+    LOG("screen refresh interval: %d ms", state.config.refresh_interval_ms);
+    state.refresh_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (state.refresh_timer_fd >= 0) {
+      struct itimerspec its;
+      its.it_value.tv_sec = state.config.refresh_interval_ms / 1000;
+      its.it_value.tv_nsec =
+          (state.config.refresh_interval_ms % 1000) * 1000000L;
+      its.it_interval = its.it_value;
+      timerfd_settime(state.refresh_timer_fd, 0, &its, NULL);
+    }
   }
 
   // Main event loop with timer support

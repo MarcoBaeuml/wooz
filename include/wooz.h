@@ -14,6 +14,9 @@ struct wooz_config {
   double initial_zoom; // Initial zoom percentage (0.0 = no zoom, 0.1 = 10%)
   char *output_filter; // Filter to specific output name (NULL = all outputs)
   bool invert_scroll; // Invert scroll direction (scroll up zooms in)
+  bool verbose;        // Print debug messages to stderr
+  bool no_fullscreen;  // Skip xdg_toplevel_set_fullscreen (useful on niri etc.)
+  int refresh_interval_ms; // Screen refresh interval in ms (0 = disable, default 1000)
 };
 
 struct wooz_state {
