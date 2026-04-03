@@ -14,6 +14,9 @@ struct wooz_config {
   double initial_zoom; // Initial zoom percentage (0.0 = no zoom, 0.1 = 10%)
   char *output_filter; // Filter to specific output name (NULL = all outputs)
   bool invert_scroll; // Invert scroll direction (scroll up zooms in)
+  bool verbose;        // Print debug messages to stderr
+  bool no_fullscreen;  // Skip xdg_toplevel_set_fullscreen (useful on niri etc.)
+  int refresh_interval_ms; // Screen refresh interval in ms (0 = disable, default 1000)
 };
 
 struct wooz_state {
@@ -38,6 +41,9 @@ struct wooz_state {
   uint32_t pressed_key;
   int repeat_timer_fd;
 
+  // Periodic screen refresh timer
+  int refresh_timer_fd;
+
   size_t n_done;
 };
 
@@ -61,6 +67,7 @@ struct wooz_output {
   struct wooz_buffer *buffer;
   struct zwlr_screencopy_frame_v1 *screencopy_frame;
   uint32_t screencopy_frame_flags; // enum zwlr_screencopy_frame_v1_flags
+  bool is_refresh; // true if screencopy_frame is a live-refresh (not initial)
 };
 
 struct wooz_window {

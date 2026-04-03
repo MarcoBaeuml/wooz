@@ -18,6 +18,11 @@ wooz [options...]
 * `--output NAME` - Run on specific output (e.g., 'DP-1', 'HDMI-A-1')
 * `--zoom-in PERCENT` - Set initial zoom percentage (e.g., '10%', '50%')
 * `--invert-scroll` - Invert scroll direction (scroll up zooms in)
+* `--verbose` - Print debug messages to stderr (useful for diagnosing issues)
+* `--no-fullscreen` - Skip `xdg_toplevel_set_fullscreen` (useful on niri and
+  other compositors that handle fullscreen differently)
+* `--refresh-interval MS` - Screen refresh interval in milliseconds
+  (default: 1000, 0 = disable refresh)
 
 ### Controls
 
@@ -53,6 +58,18 @@ wooz --zoom-in 25% --mouse-track --map-close x
 
 # Invert scroll direction (scroll up to zoom in)
 wooz --invert-scroll
+
+# Debug mode: print all Wayland protocol events (helpful when something doesn't work)
+wooz --verbose
+
+# On niri (or other compositors that don't honour set_fullscreen the usual way)
+wooz --no-fullscreen --verbose
+
+# Disable the automatic 1-second screen refresh
+wooz --refresh-interval 0
+
+# Refresh every 500 ms instead of the default 1000 ms
+wooz --refresh-interval 500
 ```
 
 
