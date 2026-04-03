@@ -109,6 +109,8 @@ static void render_window(struct wooz_window *win) {
                          wl_fixed_from_double(win->view_source.width),
                          wl_fixed_from_double(win->view_source.height));
 
+  // Mark the whole buffer as damaged so the compositor repaints the surface.
+  wl_surface_damage_buffer(win->surface, 0, 0, INT32_MAX, INT32_MAX);
   wl_surface_commit(win->surface);
 }
 
@@ -255,6 +257,15 @@ static void screencopy_frame_handle_ready(
     struct wooz_window *win;
     wl_list_for_each(win, &output->state->windows, link) {
       if (win->output == output) {
+        // Reset view_source to cover the entire buffer.  The screencopy
+        // captured the compositor's current output, which already includes
+        // whatever zoom/pan was in effect, so showing the full buffer at
+        // 1:1 preserves the effective zoom level without spiralling inward
+        // on successive refreshes.
+        win->view_source.x = 0.0;
+        win->view_source.y = 0.0;
+        win->view_source.width = (double)output->buffer->width;
+        win->view_source.height = (double)output->buffer->height;
         wl_surface_attach(win->surface, output->buffer->wl_buffer, 0, 0);
         render_window(win);
         break;
@@ -472,6 +483,7 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
     return; // render_window already calls wl_surface_commit
   }
 
+  wl_surface_damage_buffer(win->surface, 0, 0, INT32_MAX, INT32_MAX);
   wl_surface_commit(win->surface);
 }
 
