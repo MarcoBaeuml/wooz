@@ -265,6 +265,11 @@ static void screencopy_frame_handle_ready(
     output->screencopy_frame = NULL;
   } else {
     ++output->state->n_done;
+    // The initial capture frame has served its purpose. Destroy it so that
+    // trigger_screen_refresh() doesn't see a non-NULL screencopy_frame and
+    // skip this output forever.
+    zwlr_screencopy_frame_v1_destroy(output->screencopy_frame);
+    output->screencopy_frame = NULL;
   }
 }
 
